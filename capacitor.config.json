@@ -1,0 +1,6 @@
+{
+  "appId": "com.Noel.Nexus",
+  "appName": "Nexus-Admin ",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
