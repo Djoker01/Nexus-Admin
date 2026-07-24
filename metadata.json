@@ -1,0 +1,6 @@
+{
+  "name": "Nexus Admin",
+  "description": "Sistema de administración de pequeños negocios Nexus Admin con gestión de inventarios, ventas, caja, gastos, cuentas por cobrar, mermas, reabastecimiento, análisis de proveedores, reportes y respaldos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
