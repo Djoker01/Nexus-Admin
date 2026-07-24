@@ -1,0 +1,471 @@
+name: Build Android
+run-name: "Android build #${{ inputs.build_number }} (${{ inputs.build_id }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:   { description: "Lovable project ID", required: true, type: string }
+      build_id:     { description: "Lovable build ID",   required: true, type: string }
+      app_version:  { description: "App version",        required: true, type: string }
+      build_number: { description: "Build number",       required: true, type: string }
+      app_name:     { description: "App display name",   required: true, type: string }
+      bundle_id:    { description: "App bundle ID",      required: true, type: string }
+      report_url:   { description: "Lovable report URL", required: true, type: string }
+      report_token: { description: "Lovable report token", required: true, type: string }
+      skip_artifact_upload: { description: "Sandbox mode — skip artifact upload", required: false, type: string, default: "false" }
+      build_type:   { description: "Android artifact type: apk or aab", required: false, type: string, default: "apk" }
+
+concurrency:
+  group: android-${{ inputs.project_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      LOVABLE_PROJECT_ID: ${{ inputs.project_id }}
+      LOVABLE_BUILD_ID:   ${{ inputs.build_id }}
+      APP_VERSION:        ${{ inputs.app_version }}
+      BUILD_NUMBER:       ${{ inputs.build_number }}
+      APP_NAME:           ${{ inputs.app_name }}
+      BUNDLE_ID:          ${{ inputs.bundle_id }}
+      REPORT_URL:         ${{ inputs.report_url }}
+      REPORT_TOKEN:       ${{ inputs.report_token }}
+    steps:
+
+      - name: Configure Lovable reporter
+        shell: bash
+        run: |
+          cat > /tmp/lov_report <<'BASH'
+          #!/usr/bin/env bash
+          set -u
+
+          post_payload() {
+            # Capture response so validation errors from report-build (e.g.
+            # rejected artifacts) surface in the runner log instead of being
+            # silently dropped.
+            local resp http
+            resp="$(curl -sS -o /tmp/lov_report_resp -w '%{http_code}' -X POST -H "Content-Type: application/json" --data "$1" "$REPORT_URL" 2>/dev/null || echo 000)"
+            http="$resp"
+            if [ "$http" != "200" ] && [ "$http" != "000" ]; then
+              echo "::warning::report-build returned HTTP $http" >&2
+              head -c 4000 /tmp/lov_report_resp >&2 || true
+              echo >&2
+            elif [ -s /tmp/lov_report_resp ] && grep -q '"artifact_errors"' /tmp/lov_report_resp 2>/dev/null; then
+              echo "::warning::report-build accepted request but rejected one or more artifacts:" >&2
+              head -c 4000 /tmp/lov_report_resp >&2 || true
+              echo >&2
+            fi
+          }
+
+          make_payload() {
+            python3 - "$@" <<'PYJSON'
+          import json, os, sys
+          mode = sys.argv[1] if len(sys.argv) > 1 else ""
+          payload = {
+              "build_id": os.environ.get("LOVABLE_BUILD_ID", ""),
+              "token": os.environ.get("REPORT_TOKEN", ""),
+          }
+          if mode == "status":
+              payload["status"] = sys.argv[2] if len(sys.argv) > 2 else "building"
+          elif mode == "log":
+              payload["log"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["level"] = sys.argv[3] if len(sys.argv) > 3 else "info"
+          elif mode == "final":
+              payload["status"] = sys.argv[2] if len(sys.argv) > 2 else "failed"
+              payload["error_message"] = sys.argv[3] if len(sys.argv) > 3 else ""
+              if len(sys.argv) > 4 and sys.argv[4]:
+                  payload["failed_step"] = sys.argv[4]
+              if len(sys.argv) > 5 and sys.argv[5]:
+                  payload["error_summary"] = sys.argv[5]
+              if len(sys.argv) > 6 and sys.argv[6]:
+                  payload["error_category"] = sys.argv[6]
+          elif mode == "fail":
+              # args: step, summary, tail_file, category
+              payload["failed_step"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["error_summary"] = sys.argv[3] if len(sys.argv) > 3 else ""
+              tail_file = sys.argv[4] if len(sys.argv) > 4 else ""
+              if len(sys.argv) > 5 and sys.argv[5]:
+                  payload["error_category"] = sys.argv[5]
+              if tail_file and os.path.exists(tail_file):
+                  try:
+                      with open(tail_file, "r", errors="replace") as fh:
+                          lines = [l.rstrip("\n") for l in fh.readlines()]
+                      payload["log_tail"] = lines[-80:]
+                  except Exception:
+                      pass
+          elif mode == "artifacts":
+              # args: one or more glob-expanded file paths produced by the build.
+              # For each file: hash it, request a signed upload URL for the
+              # private 'artifacts' bucket, PUT the bytes directly to Storage,
+              # then include storage_path in the artifacts payload so the
+              # download UI can mint fresh expiring signed URLs.
+              import glob, hashlib, urllib.request, urllib.error
+              report_url = os.environ.get("REPORT_URL", "")
+              base = report_url.rsplit("/", 1)[0]  # strip trailing /report-build
+              upload_endpoint = base + "/artifact-upload-url"
+              build_id = os.environ.get("LOVABLE_BUILD_ID", "")
+              token = os.environ.get("REPORT_TOKEN", "")
+              seen = set()
+              artifacts = []
+              for pattern in sys.argv[2:]:
+                  for path in sorted(glob.glob(pattern)):
+                      if not os.path.isfile(path) or path in seen:
+                          continue
+                      seen.add(path)
+                      name = os.path.basename(path)
+                      lower = name.lower()
+                      kind = ("apk" if lower.endswith(".apk")
+                              else "aab" if lower.endswith(".aab")
+                              else "ipa" if lower.endswith(".ipa")
+                              else "other")
+                      if kind == "other":
+                          continue
+                      try:
+                          size = os.path.getsize(path)
+                      except OSError:
+                          size = None
+                      sha = hashlib.sha256()
+                      try:
+                          with open(path, "rb") as fh:
+                              for chunk in iter(lambda: fh.read(1 << 20), b""):
+                                  sha.update(chunk)
+                          digest = sha.hexdigest()
+                      except OSError:
+                          digest = None
+                      storage_path = None
+                      try:
+                          req = urllib.request.Request(
+                              upload_endpoint,
+                              data=json.dumps({"build_id": build_id, "token": token, "filename": name}).encode(),
+                              headers={"Content-Type": "application/json"},
+                              method="POST",
+                          )
+                          with urllib.request.urlopen(req, timeout=30) as resp:
+                              signed = json.loads(resp.read())
+                          upload_url = signed.get("upload_url")
+                          storage_path = signed.get("path")
+                          if upload_url and storage_path:
+                              with open(path, "rb") as fh:
+                                  put = urllib.request.Request(
+                                      upload_url,
+                                      data=fh.read(),
+                                      headers={"Content-Type": "application/octet-stream", "x-upsert": "true"},
+                                      method="PUT",
+                                  )
+                                  urllib.request.urlopen(put, timeout=600).read()
+                      except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+                          sys.stderr.write("artifact upload failed for {}: {}\n".format(name, exc))
+                          storage_path = None
+                      artifacts.append({
+                          "filename": name,
+                          "kind": kind,
+                          "size_bytes": size,
+                          "sha256": digest,
+                          "storage_path": storage_path,
+                      })
+              payload["artifacts"] = artifacts
+          print(json.dumps(payload))
+          PYJSON
+          }
+
+
+          extract_summary() {
+            # Pick the most descriptive line from a log file: prefer first line
+            # containing error/failed/exception, else the last non-empty line.
+            local file="$1"
+            local s
+            s="$(grep -iE '(^npm (ERR!|error)|ERESOLVE|EUSAGE|Could not find|Unable to resolve|Capacitor.*(error|failed)|failed to|exception|fatal|denied)' "$file" 2>/dev/null | head -n 1 || true)"
+            if [ -z "$s" ]; then
+              s="$(grep -iE 'error|failed|exception|fatal|denied' "$file" 2>/dev/null | head -n 1 || true)"
+            fi
+            if [ -z "$s" ]; then
+              s="$(tac "$file" 2>/dev/null | grep -m1 -E '\S' || true)"
+            fi
+            # Trim and cap length
+            printf '%s' "$s" | tr -d '\r' | cut -c1-400
+          }
+
+          classify_error() {
+            # Emit a single structured category the UI can render as a badge.
+            # Order matters: signing/github-app checked first so they aren't
+            # shadowed by generic gradle/xcode failures they trigger.
+            local step="$1"
+            local file="$2"
+            local haystack=""
+            [ -n "$step" ] && haystack="$step "
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              haystack="$haystack$(tail -c 20000 "$file" 2>/dev/null || true)"
+            fi
+            local lc
+            lc="$(printf '%s' "$haystack" | tr '[:upper:]' '[:lower:]')"
+            case "$lc" in
+              *"github app"*|*"app not installed"*|*"installation not found"*|*"resource not accessible by integration"*|*"bad credentials"*|*"repository not accessible"*)
+                printf 'github_app_error'; return ;;
+            esac
+            case "$lc" in
+              *"keystore"*|*"jarsigner"*|*"apksigner"*|*"code sign"*|*"codesign"*|*"provisioning profile"*|*"no signing certificate"*|*"apple_cert"*|*"android_key"*|*"signingconfig"*)
+                printf 'signing_error'; return ;;
+            esac
+            case "$lc" in
+              *"gradle"*|*"aapt"*|*"aab"*"error"*|*":app:"*|*"execution failed for task"*)
+                printf 'gradle_error'; return ;;
+            esac
+            case "$lc" in
+              *"xcodebuild"*|*"xcode "*|*"** archive failed"*|*"** export failed"*|*"exportarchive"*)
+                printf 'xcode_error'; return ;;
+            esac
+            case "$lc" in
+              *"cocoapods"*|*"pod install"*|*"pod repo"*|*"cdn: trunk"*)
+                printf 'cocoapods_error'; return ;;
+            esac
+            case "$lc" in
+              *"npm err"*|*"eresolve"*|*"eusage"*|*"npm ci"*"failed"*|*"npm install"*"failed"*|*"peer dep"*|*"unable to resolve dependency"*)
+                printf 'npm_error'; return ;;
+            esac
+            case "$lc" in
+              *"capacitor"*|*"cap sync"*|*"cap add"*)
+                printf 'capacitor_error'; return ;;
+            esac
+            case "$lc" in
+              *"etimedout"*|*"timed out"*|*"timeout"*|*"deadline exceeded"*)
+                printf 'timeout_error'; return ;;
+            esac
+            case "$lc" in
+              *"econnreset"*|*"econnrefused"*|*"getaddrinfo"*|*"network is unreachable"*|*"could not resolve host"*|*"tls handshake"*)
+                printf 'network_error'; return ;;
+            esac
+            printf 'unknown'
+          }
+
+
+          mode="${1:-}"; shift || true
+          if [ "$mode" = "status" ]; then
+            post_payload "$(make_payload status "${1:-building}")"
+          elif [ "$mode" = "log" ]; then
+            post_payload "$(make_payload log "${1:-}" "${2:-info}")"
+          elif [ "$mode" = "final" ]; then
+            # final <status> <error_message> [failed_step] [error_summary] [error_category]
+            post_payload "$(make_payload final "${1:-failed}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+          elif [ "$mode" = "fail" ]; then
+            # fail <step> <summary> <tail_file> [category]
+            post_payload "$(make_payload fail "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+          elif [ "$mode" = "artifacts" ]; then
+            # artifacts <glob> [<glob>...] — hash each file & POST size + sha256
+            post_payload "$(make_payload artifacts "$@")"
+          elif [ "$mode" = "run" ]; then
+            label="${1:-Step}"; shift || true
+            tmp="$(mktemp)"
+            "$0" log "$label"
+            set +e
+            "$@" > >(tee "$tmp") 2>&1
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              summary="$(extract_summary "$tmp")"
+              [ -z "$summary" ] && summary="$label failed with exit code $status"
+              category="$(classify_error "$label" "$tmp")"
+              # Record the failing step so the final-status step can include it.
+              echo "$label" > /tmp/lov_failed_step
+              printf '%s' "$summary" > /tmp/lov_error_summary
+              printf '%s' "$category" > /tmp/lov_error_category
+              echo "::warning::Build step '$label' failed — category=$category"
+              tail -n 120 "$tmp" | while IFS= read -r line; do "$0" log "$line" error; done
+              "$0" log "Category: $category" error
+              "$0" fail "$label" "$summary" "$tmp" "$category"
+              "$0" log "$label failed with exit code $status" error
+              exit "$status"
+            fi
+            "$0" log "$label complete" success
+          fi
+          BASH
+          chmod +x /tmp/lov_report
+          echo "/tmp" >> "$GITHUB_PATH"
+      - name: Report build started
+        shell: bash
+        run: lov_report status building
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          lov_report run "Install dependencies" bash -lc '
+            set -u
+            if [ -f package-lock.json ]; then
+              if ! npm ci --no-audit --no-fund; then
+                echo "::warning::npm ci failed (lockfile out of sync or peer conflict); regenerating lockfile and falling back to npm install --legacy-peer-deps"
+                rm -f package-lock.json
+                npm install --no-audit --no-fund --legacy-peer-deps
+              fi
+            else
+              echo "::warning::No package-lock.json found; generating one with npm install"
+              npm install --no-audit --no-fund --legacy-peer-deps
+            fi
+            # Verify the install actually produced node_modules with a usable vite binary
+            if [ ! -d node_modules ]; then
+              echo "::error::node_modules missing after install"
+              exit 1
+            fi
+          '
+      - name: Build web app
+        shell: bash
+        run: lov_report run "Build web app" npm run build
+      - name: Prepare Capacitor Android project
+        shell: bash
+        run: |
+          cat > /tmp/lov_prepare_android.sh <<'BASH'
+            set -e
+
+            # Keep Capacitor packages on the same major as the app. Forcing
+            # Capacitor 6 here caused recurring ERESOLVE/platform resolution
+            # failures for repos already on another Capacitor major.
+            CAP_CORE_VERSION="$(node -p 'try{require("./node_modules/@capacitor/core/package.json").version}catch(e){""}')"
+            if [ -n "$CAP_CORE_VERSION" ]; then
+              CAP_MAJOR="$(printf '%s' "$CAP_CORE_VERSION" | cut -d. -f1)"
+            else
+              CAP_MAJOR="$(node -p 'try{const p=require("./package.json");const s=(p.dependencies&&p.dependencies["@capacitor/core"])||(p.devDependencies&&p.devDependencies["@capacitor/core"])||"";const m=String(s).match(/[0-9]+/);m?m[0]:""}catch(e){""}')"
+            fi
+            CAP_MAJOR="$(printf '%s' "${CAP_MAJOR:-6}" | grep -E '^[0-9]+$' || printf '6')"
+
+            CAP_PACKAGES=()
+            if [ -z "$CAP_CORE_VERSION" ]; then
+              CAP_PACKAGES+=("@capacitor/core@^$CAP_MAJOR")
+            fi
+            CAP_PACKAGES+=("@capacitor/cli@^$CAP_MAJOR" "@capacitor/android@^$CAP_MAJOR")
+            npm install --no-save --legacy-peer-deps "${CAP_PACKAGES[@]}"
+
+            if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
+              npx --no-install cap init "$APP_NAME" "$BUNDLE_ID" --web-dir=dist
+            fi
+            if [ ! -d android ]; then
+              npx --no-install cap add android
+            fi
+            if [ -f resources/icon.png ]; then
+              npm install --no-save --legacy-peer-deps @capacitor/assets@^3
+              npx --no-install capacitor-assets generate --android || true
+            fi
+            npx --no-install cap sync android
+          BASH
+          lov_report run "Prepare Capacitor Android project" bash /tmp/lov_prepare_android.sh
+
+      - name: Configure Android signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && [ -n "${ANDROID_KEY_ALIAS:-}" ] && [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
+            mkdir -p android/app
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+            cat > android/keystore.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=release.keystore
+          EOF
+            # Idempotent: skip appending the lovableRelease signing block if a
+            # previous run on the same checkout (cached workspace, re-run, etc.)
+            # already added it — Gradle errors on duplicate signingConfigs.
+            if ! grep -q "lovableRelease" android/app/build.gradle; then
+              cat >> android/app/build.gradle <<'EOF'
+
+          def lovableKeystoreProperties = new Properties()
+          def lovableKeystorePropertiesFile = rootProject.file('keystore.properties')
+          if (lovableKeystorePropertiesFile.exists()) {
+              lovableKeystoreProperties.load(new FileInputStream(lovableKeystorePropertiesFile))
+          }
+
+          android {
+              signingConfigs {
+                  lovableRelease {
+                      storeFile file(lovableKeystoreProperties['storeFile'])
+                      storePassword lovableKeystoreProperties['storePassword']
+                      keyAlias lovableKeystoreProperties['keyAlias']
+                      keyPassword lovableKeystoreProperties['keyPassword']
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.lovableRelease
+                  }
+              }
+          }
+          EOF
+            fi
+            if [ "${{ inputs.build_type }}" = "aab" ]; then
+              echo "ANDROID_BUILD_TASK=:app:bundleRelease" >> "$GITHUB_ENV"
+            else
+              echo "ANDROID_BUILD_TASK=:app:assembleRelease" >> "$GITHUB_ENV"
+            fi
+            lov_report log "Android signing configured (target: ${{ inputs.build_type }})" success
+          else
+            lov_report fail "Configure Android signing" "Android signing secrets are incomplete; refusing to produce an unsigned debug artifact" "" "signing_error"
+            exit 1
+          fi
+      - name: Build Android artifact
+        working-directory: android
+        shell: bash
+        run: lov_report run "Gradle build" bash -lc 'chmod +x ./gradlew && ./gradlew "$ANDROID_BUILD_TASK" --no-daemon -Pversion="$APP_VERSION" -PversionCode="$BUILD_NUMBER"'
+      - name: Report Android artifact metadata
+        if: success()
+        shell: bash
+        run: |
+          lov_report artifacts \
+            'android/app/build/outputs/apk/release/*.apk' \
+            'android/app/build/outputs/apk/debug/*.apk' \
+            'android/app/build/outputs/bundle/release/*.aab'
+      - name: Upload Android artifact
+        if: ${{ inputs.skip_artifact_upload != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-${{ inputs.build_type }}-${{ inputs.build_number }}
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+          retention-days: 30
+      - name: Report artifact
+        shell: bash
+        run: |
+          if [ "${{ inputs.skip_artifact_upload }}" = "true" ]; then
+            lov_report log "Sandbox build: artifact upload skipped" success
+          else
+            lov_report log "Android ${{ inputs.build_type }} artifact uploaded (#${{ inputs.build_number }})" success
+          fi
+
+      - name: Report final status
+        if: always()
+        shell: bash
+        run: |
+          failed_step=""
+          error_summary=""
+          error_category=""
+          if [ -f /tmp/lov_failed_step ]; then failed_step="$(cat /tmp/lov_failed_step)"; fi
+          if [ -f /tmp/lov_error_summary ]; then error_summary="$(cat /tmp/lov_error_summary)"; fi
+          if [ -f /tmp/lov_error_category ]; then error_category="$(cat /tmp/lov_error_category)"; fi
+          if [ "${{ job.status }}" = "success" ]; then
+            lov_report final success "" "" "" ""
+          elif [ "${{ job.status }}" = "cancelled" ]; then
+            lov_report final cancelled "Workflow cancelled" "$failed_step" "$error_summary" "$error_category"
+          else
+            msg="Workflow job failed (see GitHub Actions logs)"
+            [ -n "$error_summary" ] && msg="$error_summary"
+            [ -z "$error_category" ] && error_category="unknown"
+            lov_report final failed "$msg" "$failed_step" "$error_summary" "$error_category"
+          fi
