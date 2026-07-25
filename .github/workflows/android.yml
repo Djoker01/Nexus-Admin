@@ -20,36 +20,36 @@ jobs:
     - name: Install dependencies
       run: npm install
 
-    - name: Build web app (with automatic index.html fix)
-      run: |
-        # Si no existe index.html en la raíz, lo creamos
-        if [ ! -f "index.html" ]; then
-          echo "⚠️ index.html no encontrado. Creando uno básico..."
-          cat > index.html << 'EOF'
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Nexus Admin</title>
-        </head>
-        <body>
-          <div id="app">Cargando Nexus Admin...</div>
-          <script type="module" src="/src/main.js"></script>
-        </body>
-        </html>
-        EOF
-        fi
+    - name: Build web app (with automatic entry detection)
+  run: |
+    # Crea un index.html básico
+    cat > index.html << 'EOF'
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Nexus Admin</title>
+    </head>
+    <body>
+      <div id="app"></div>
+      <script type="module" src="/src/App.jsx"></script>
+    </body>
+    </html>
+    EOF
 
-        # Si existe src/index.js, ajustamos el punto de entrada
-        if [ -f "src/index.js" ] && [ -f "index.html" ]; then
-          echo "⚠️ Ajustando index.html para usar src/index.js"
-          sed -i 's|/src/main.js|/src/index.js|g' index.html
-        fi
-
-        # Ejecutar la build
-        npm run build
-
+    # Detecta automáticamente el punto de entrada real
+    if [ -f "src/main.js" ]; then
+      sed -i 's|/src/App.jsx|/src/main.js|g' index.html
+    elif [ -f "src/index.js" ]; then
+      sed -i 's|/src/App.jsx|/src/index.js|g' index.html
+    elif [ -f "src/App.js" ]; then
+      sed -i 's|/src/App.jsx|/src/App.js|g' index.html
+    elif [ -f "src/index.tsx" ]; then
+      sed -i 's|/src/App.jsx|/src/index.tsx|g' index.html
+    fi
+    
+    npm run build
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
