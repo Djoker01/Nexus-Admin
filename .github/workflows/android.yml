@@ -20,8 +20,35 @@ jobs:
     - name: Install dependencies
       run: npm install
 
-    - name: Build web app
-      run: npm run build
+    - name: Build web app (with automatic index.html fix)
+      run: |
+        # Si no existe index.html en la raíz, lo creamos
+        if [ ! -f "index.html" ]; then
+          echo "⚠️ index.html no encontrado. Creando uno básico..."
+          cat > index.html << 'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Nexus Admin</title>
+        </head>
+        <body>
+          <div id="app">Cargando Nexus Admin...</div>
+          <script type="module" src="/src/main.js"></script>
+        </body>
+        </html>
+        EOF
+        fi
+
+        # Si existe src/index.js, ajustamos el punto de entrada
+        if [ -f "src/index.js" ] && [ -f "index.html" ]; then
+          echo "⚠️ Ajustando index.html para usar src/index.js"
+          sed -i 's|/src/main.js|/src/index.js|g' index.html
+        fi
+
+        # Ejecutar la build
+        npm run build
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
